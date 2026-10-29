@@ -1,0 +1,1036 @@
+{
+  "name": "AI Email Assistant",
+  "active": false,
+  "nodes": [
+    {
+      "id": "gmail-trigger",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        280
+      ],
+      "parameters": {
+        "authentication": "oAuth2",
+        "event": "messageReceived",
+        "simple": false,
+        "maxResults": 10,
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {
+          "includeSpamTrash": false,
+          "includeDrafts": false,
+          "q": "in:inbox",
+          "readStatus": "both"
+        },
+        "options": {
+          "downloadAttachments": false
+        }
+      },
+      "notes": "Poll the test inbox once a minute. Simplify is off so the body is included. Use a Gmail credential whose only scope is https://www.googleapis.com/auth/gmail.readonly. Do not grant compose, modify, or send scopes, and do not add a Gmail send node.",
+      "notesInFlow": true
+    },
+    {
+      "id": "manual-sample",
+      "name": "Manual sample email",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        40
+      ],
+      "parameters": {},
+      "notes": "Editor-only sample. It does not poll Gmail and it does not send mail.",
+      "notesInFlow": true
+    },
+    {
+      "id": "load-sample",
+      "name": "Load sample email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        40
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "return {\n  json: {\n    id: \"sample-message-001\",\n    labelIds: [\"INBOX\"],\n    subject: \"Services\",\n    date: \"2026-10-28T04:15:00.000Z\",\n    text: \"Hello, I would like information about your services.\",\n    html: false,\n    from: {\n      text: \"Person <person@example.com>\",\n      value: [{ address: \"person@example.com\", name: \"Person\" }],\n    },\n  },\n};"
+      },
+      "notes": "Provide one synthetic message in the same shape the Gmail trigger emits.",
+      "notesInFlow": true
+    },
+    {
+      "id": "normalize-email",
+      "name": "Normalize email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "// Normalize one Gmail message into the Python API payload.\n// This file is copied into n8n/workflows/ai_email_assistant.json.\n// Keep credentials out of this file.\n\nconst MAX_IDENTIFIER = 255;\nconst MAX_SUBJECT = 500;\nconst MAX_BODY = 20000;\nconst EMAIL_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/;\n\nfunction normalizeGmailMessage(message) {\n  if (message === null || typeof message !== \"object\" || Array.isArray(message)) {\n    return skipped(\"unsupported format\", null);\n  }\n\n  const emailIdentifier = cleanIdentifier(message.id);\n  if (!emailIdentifier) {\n    return skipped(\"missing email identifier\", null);\n  }\n\n  const labels = labelsOf(message);\n  if (labels.includes(\"DRAFT\")) {\n    return skipped(\"draft\", emailIdentifier);\n  }\n  if (labels.includes(\"SENT\") && !labels.includes(\"INBOX\")) {\n    return skipped(\"sent mail\", emailIdentifier);\n  }\n\n  const sender = extractSender(message);\n  if (!sender) {\n    return skipped(\"missing sender\", emailIdentifier);\n  }\n\n  const receivedAt = extractReceivedAt(message);\n  if (!receivedAt) {\n    return skipped(\"missing received timestamp\", emailIdentifier);\n  }\n\n  const body = extractBody(message);\n  if (!body) {\n    if (snippetOnly(message)) {\n      return skipped(\"message body was not included\", emailIdentifier);\n    }\n    return skipped(\n      isNonText(message) ? \"unsupported format\" : \"empty message\",\n      emailIdentifier,\n    );\n  }\n\n  return {\n    ok: true,\n    email_identifier: emailIdentifier,\n    payload: {\n      email_identifier: emailIdentifier,\n      sender_address: sender,\n      subject: extractSubject(message),\n      body_text: body,\n      received_at: receivedAt,\n    },\n  };\n}\n\nfunction skipped(reason, emailIdentifier) {\n  return { ok: false, reason, email_identifier: emailIdentifier };\n}\n\nfunction cleanIdentifier(value) {\n  if (value === null || value === undefined) {\n    return null;\n  }\n  const identifier = String(value).trim();\n  if (\n    !identifier ||\n    identifier.length > MAX_IDENTIFIER ||\n    /[\\u0000-\\u001F\\u007F\\s]/.test(identifier)\n  ) {\n    return null;\n  }\n  return identifier;\n}\n\nfunction labelsOf(message) {\n  if (Array.isArray(message.labelIds)) {\n    return message.labelIds.map((label) => String(label));\n  }\n  if (Array.isArray(message.labels)) {\n    return message.labels.map((label) => String(label.name || label.id || label));\n  }\n  return [];\n}\n\nfunction extractSender(message) {\n  const candidates = [\n    message.from,\n    message.From,\n    headerValue(message, \"from\"),\n  ];\n  for (const candidate of candidates) {\n    const address = firstAddress(candidate);\n    if (address) {\n      return address;\n    }\n  }\n  return null;\n}\n\nfunction firstAddress(value) {\n  if (!value) {\n    return null;\n  }\n  if (typeof value === \"string\") {\n    const match = value.match(EMAIL_ADDRESS);\n    return match ? match[0] : null;\n  }\n  if (Array.isArray(value)) {\n    for (const item of value) {\n      const address = firstAddress(item && (item.address || item.text || item));\n      if (address) {\n        return address;\n      }\n    }\n    return null;\n  }\n  if (typeof value === \"object\") {\n    return (\n      firstAddress(value.value) ||\n      firstAddress(value.text) ||\n      firstAddress(value.address)\n    );\n  }\n  return null;\n}\n\nfunction headerValue(message, name) {\n  const headers = message.headers;\n  if (headers && typeof headers === \"object\" && !Array.isArray(headers)) {\n    for (const [key, value] of Object.entries(headers)) {\n      if (key.toLowerCase() === name) {\n        return value;\n      }\n    }\n  }\n  const payloadHeaders = message.payload && message.payload.headers;\n  if (Array.isArray(payloadHeaders)) {\n    const found = payloadHeaders.find(\n      (header) => String(header.name || \"\").toLowerCase() === name,\n    );\n    if (found) {\n      return found.value;\n    }\n  }\n  return null;\n}\n\nfunction extractReceivedAt(message) {\n  return (\n    parseTimestamp(message.date) ||\n    parseTimestamp(message.internalDate) ||\n    parseTimestamp(headerValue(message, \"date\"))\n  );\n}\n\nfunction parseTimestamp(value) {\n  if (value === null || value === undefined || value === false || value === \"\") {\n    return null;\n  }\n  if (typeof value === \"number\" && Number.isFinite(value)) {\n    const milliseconds = value < 1e12 ? value * 1000 : value;\n    return isoOrNull(new Date(milliseconds));\n  }\n  const text = String(value).trim().replace(/^date:\\s*/i, \"\");\n  if (!text) {\n    return null;\n  }\n  if (/^\\d{11,}$/.test(text)) {\n    return parseTimestamp(Number(text));\n  }\n  return isoOrNull(new Date(text));\n}\n\nfunction isoOrNull(date) {\n  return Number.isNaN(date.getTime()) ? null : date.toISOString();\n}\n\nfunction extractSubject(message) {\n  const raw = message.subject || message.Subject || headerValue(message, \"subject\");\n  if (raw === null || raw === undefined || raw === false) {\n    return null;\n  }\n  const cleaned = collapse(stripControls(String(raw))).replace(/\\n+/g, \" \");\n  if (!cleaned) {\n    return null;\n  }\n  return cleaned.length <= MAX_SUBJECT ? cleaned : cleaned.slice(0, MAX_SUBJECT);\n}\n\nfunction extractBody(message) {\n  const plain = typeof message.text === \"string\" ? collapse(stripControls(message.text)) : \"\";\n  if (plain) {\n    return limitText(plain, MAX_BODY);\n  }\n  if (typeof message.html === \"string\" && message.html.trim()) {\n    const fromHtml = stripHtml(message.html);\n    if (fromHtml) {\n      return limitText(fromHtml, MAX_BODY);\n    }\n  }\n\n  const parts = [];\n  collectParts(message.payload, parts);\n  const plainPart = parts.find((part) => part.mime === \"text/plain\");\n  const htmlPart = parts.find((part) => part.mime === \"text/html\");\n  if (plainPart) {\n    const text = collapse(stripControls(plainPart.text));\n    if (text) {\n      return limitText(text, MAX_BODY);\n    }\n  }\n  if (htmlPart) {\n    const text = stripHtml(htmlPart.text);\n    if (text) {\n      return limitText(text, MAX_BODY);\n    }\n  }\n  return null;\n}\n\nfunction snippetOnly(message) {\n  if (typeof message.snippet !== \"string\" || !message.snippet.trim()) {\n    return false;\n  }\n  if (message.text || message.html) {\n    return false;\n  }\n  if (!message.payload) {\n    return true;\n  }\n  const parts = [];\n  collectParts(message.payload, parts);\n  const data = message.payload.body && message.payload.body.data;\n  return parts.length === 0 && !data;\n}\n\nfunction isNonText(message) {\n  if (!message.payload) {\n    return false;\n  }\n  const mimes = [];\n  collectMimes(message.payload, mimes);\n  if (mimes.length === 0) {\n    return nonTextMime(message.payload.mimeType);\n  }\n  return mimes.every((mime) => !mime.startsWith(\"text/\") && !mime.startsWith(\"multipart/\"));\n}\n\nfunction nonTextMime(mime) {\n  const value = String(mime || \"\").toLowerCase();\n  return (\n    value.startsWith(\"application/\") ||\n    value.startsWith(\"image/\") ||\n    value.startsWith(\"audio/\") ||\n    value.startsWith(\"video/\")\n  );\n}\n\nfunction collectParts(part, found) {\n  if (!part || typeof part !== \"object\") {\n    return;\n  }\n  const mime = String(part.mimeType || \"\").toLowerCase();\n  const data = part.body && part.body.data;\n  if (data && (mime === \"text/plain\" || mime === \"text/html\")) {\n    found.push({ mime, text: decodeBase64Url(data) });\n  }\n  for (const child of part.parts || []) {\n    collectParts(child, found);\n  }\n}\n\nfunction collectMimes(part, found) {\n  if (!part || typeof part !== \"object\") {\n    return;\n  }\n  if (part.mimeType) {\n    found.push(String(part.mimeType).toLowerCase());\n  }\n  for (const child of part.parts || []) {\n    collectMimes(child, found);\n  }\n}\n\nfunction decodeBase64Url(value) {\n  try {\n    return Buffer.from(String(value), \"base64url\").toString(\"utf8\");\n  } catch (_error) {\n    return \"\";\n  }\n}\n\nfunction stripHtml(value) {\n  let text = String(value);\n  text = text.replace(/<script[\\s\\S]*?<\\/script>/gi, \" \");\n  text = text.replace(/<style[\\s\\S]*?<\\/style>/gi, \" \");\n  text = text.replace(/<(?:br|\\/p|\\/div|\\/tr|\\/li|\\/h[1-6])\\b[^>]*>/gi, \"\\n\");\n  text = text.replace(/<[^>]+>/g, \" \");\n  text = decodeEntities(text);\n  text = text.replace(/<[^>]+>/g, \" \");\n  return collapse(stripControls(text));\n}\n\nfunction decodeEntities(value) {\n  return value\n    .replace(/&#(\\d+);/g, (_match, digits) => safeCharacter(Number(digits)))\n    .replace(/&#x([0-9a-f]+);/gi, (_match, hex) => safeCharacter(parseInt(hex, 16)))\n    .replace(/&nbsp;/gi, \" \")\n    .replace(/&quot;/gi, '\"')\n    .replace(/&#39;|&apos;/gi, \"'\")\n    .replace(/&lt;/gi, \"<\")\n    .replace(/&gt;/gi, \">\")\n    .replace(/&amp;/gi, \"&\");\n}\n\nfunction safeCharacter(codePoint) {\n  if (!Number.isFinite(codePoint) || codePoint < 32 || codePoint === 127) {\n    return \" \";\n  }\n  try {\n    return String.fromCodePoint(codePoint);\n  } catch (_error) {\n    return \" \";\n  }\n}\n\nfunction stripControls(value) {\n  return String(value).replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]/g, \"\");\n}\n\nfunction collapse(value) {\n  return String(value)\n    .replace(/\\r\\n/g, \"\\n\")\n    .replace(/\\r/g, \"\\n\")\n    .split(\"\\n\")\n    .map((line) => line.replace(/[ \\t]+/g, \" \").trim())\n    .join(\"\\n\")\n    .replace(/\\n{3,}/g, \"\\n\\n\")\n    .trim();\n}\n\nfunction limitText(value, limit) {\n  if (value.length <= limit) {\n    return value;\n  }\n  const suffix = \"\\n[truncated]\";\n  return value.slice(0, limit - suffix.length).trimEnd() + suffix;\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { normalizeGmailMessage };\n}\n\nconst normalized = normalizeGmailMessage($json);\nif (!normalized.ok) {\n  return {\n    json: {\n      skip: true,\n      reason: normalized.reason,\n      email_identifier: normalized.email_identifier,\n    },\n  };\n}\nreturn {\n  json: {\n    skip: false,\n    email_identifier: normalized.email_identifier,\n    api_payload: normalized.payload,\n  },\n};\n"
+      },
+      "notes": "Turn the Gmail message into the API fields. Skip drafts, sent mail, empty messages, and messages without a body.",
+      "notesInFlow": true
+    },
+    {
+      "id": "email-usable",
+      "name": "Email is usable",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        160
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "not-skipped",
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "True when the normalizer produced an API payload.",
+      "notesInFlow": true
+    },
+    {
+      "id": "call-api",
+      "name": "Call Python API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:8000/api/emails/process",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.api_payload) }}",
+        "options": {
+          "timeout": 300000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "notes": "POST the normalized email. On this computer the API is http://127.0.0.1:8000. If n8n runs in Docker, change the host to host.docker.internal and set APP_HOST=0.0.0.0. Attach a Header Auth credential named X-API-Key. Do not type the key into this node. The timeout covers classification and one reply retry. This node does not send email.",
+      "notesInFlow": true
+    },
+    {
+      "id": "api-succeeded",
+      "name": "API call succeeded",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        80
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "created",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 201,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "existing",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "notes": "HTTP 201 is a new result. HTTP 200 is an existing result.",
+      "notesInFlow": true
+    },
+    {
+      "id": "already-processed",
+      "name": "Email already processed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1560,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "duplicate",
+              "leftValue": "={{ $json.body.already_processed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "The API kept the original row and did not call the model again.",
+      "notesInFlow": true
+    },
+    {
+      "id": "needs-review",
+      "name": "Needs human priority review",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1820,
+        80
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "high",
+              "leftValue": "={{ $json.body.priority }}",
+              "rightValue": "High",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "critical",
+              "leftValue": "={{ $json.body.priority }}",
+              "rightValue": "Critical",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "notes": "Route only the priority returned by the API. Do not classify the email again.",
+      "notesInFlow": true
+    },
+    {
+      "id": "route-error",
+      "name": "Route error type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1560,
+        280
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "unauthorized",
+                    "leftValue": "={{ $json.statusCode }}",
+                    "rightValue": 401,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "credentials"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "unavailable",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "ollama_unavailable",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "timeout",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "ollama_timeout",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "model",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "ollama_model_error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "ai"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "persistence",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "persistence_error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "processing",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "processing_error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "database"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rejected-status",
+                    "leftValue": "={{ $json.statusCode }}",
+                    "rightValue": 422,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "invalid-output",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "invalid_model_output",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "unsafe",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "unsafe_reply",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "invalid-email",
+                    "leftValue": "={{ $json.body.failure_code }}",
+                    "rightValue": "invalid_email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "or"
+              },
+              "renameOutput": true,
+              "outputKey": "rejected"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "notes": "Separate credential, model, database, and validation failures. The fallback is any other workflow error.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-skipped",
+      "name": "Record skipped email",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1040,
+        280
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "skipped",
+              "type": "string"
+            },
+            {
+              "id": "reason",
+              "name": "reason",
+              "value": "={{ $json.reason }}",
+              "type": "string"
+            },
+            {
+              "id": "identifier",
+              "name": "email_identifier",
+              "value": "={{ $json.email_identifier }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-duplicate",
+      "name": "Record duplicate",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1820,
+        -80
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "duplicate",
+              "type": "string"
+            },
+            {
+              "id": "already",
+              "name": "already_processed",
+              "value": true,
+              "type": "boolean"
+            },
+            {
+              "id": "email-id",
+              "name": "email_id",
+              "value": "={{ $json.body.id }}",
+              "type": "number"
+            },
+            {
+              "id": "identifier",
+              "name": "email_identifier",
+              "value": "={{ $json.body.email_identifier }}",
+              "type": "string"
+            },
+            {
+              "id": "priority",
+              "name": "priority",
+              "value": "={{ $json.body.priority }}",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "processing_status",
+              "value": "={{ $json.body.processing_status }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "flag-review",
+      "name": "Flag for human review",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2080,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "review_required",
+              "type": "string"
+            },
+            {
+              "id": "email-id",
+              "name": "email_id",
+              "value": "={{ $json.body.id }}",
+              "type": "number"
+            },
+            {
+              "id": "identifier",
+              "name": "email_identifier",
+              "value": "={{ $json.body.email_identifier }}",
+              "type": "string"
+            },
+            {
+              "id": "priority",
+              "name": "priority",
+              "value": "={{ $json.body.priority }}",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "processing_status",
+              "value": "={{ $json.body.processing_status }}",
+              "type": "string"
+            },
+            {
+              "id": "level",
+              "name": "notification_level",
+              "value": "={{ $json.body.notification.level }}",
+              "type": "string"
+            },
+            {
+              "id": "delivery",
+              "name": "notification_delivery",
+              "value": "={{ $json.body.notification.delivery }}",
+              "type": "string"
+            },
+            {
+              "id": "action",
+              "name": "action",
+              "value": "stored for human review; nothing was sent",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-routine",
+      "name": "Record routine result",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2080,
+        180
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "routine_review",
+              "type": "string"
+            },
+            {
+              "id": "email-id",
+              "name": "email_id",
+              "value": "={{ $json.body.id }}",
+              "type": "number"
+            },
+            {
+              "id": "identifier",
+              "name": "email_identifier",
+              "value": "={{ $json.body.email_identifier }}",
+              "type": "string"
+            },
+            {
+              "id": "priority",
+              "name": "priority",
+              "value": "={{ $json.body.priority }}",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "processing_status",
+              "value": "={{ $json.body.processing_status }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-credentials",
+      "name": "Record invalid API credentials",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1820,
+        220
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "failed",
+              "type": "string"
+            },
+            {
+              "id": "failure",
+              "name": "failure_code",
+              "value": "invalid_api_credentials",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "status_code",
+              "value": "={{ $json.statusCode }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-ai",
+      "name": "Record AI failure",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1820,
+        340
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "failed",
+              "type": "string"
+            },
+            {
+              "id": "failure",
+              "name": "failure_code",
+              "value": "={{ $json.body.failure_code }}",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "status_code",
+              "value": "={{ $json.statusCode }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-database",
+      "name": "Record database failure",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1820,
+        460
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "failed",
+              "type": "string"
+            },
+            {
+              "id": "failure",
+              "name": "failure_code",
+              "value": "={{ $json.body.failure_code }}",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "status_code",
+              "value": "={{ $json.statusCode }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-rejected",
+      "name": "Record rejected email",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1820,
+        580
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "failed",
+              "type": "string"
+            },
+            {
+              "id": "failure",
+              "name": "failure_code",
+              "value": "={{ $json.body.failure_code || 'validation_error' }}",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "status_code",
+              "value": "={{ $json.statusCode }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    },
+    {
+      "id": "record-workflow",
+      "name": "Record workflow failure",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1820,
+        700
+      ],
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "outcome",
+              "name": "outcome",
+              "value": "failed",
+              "type": "string"
+            },
+            {
+              "id": "failure",
+              "name": "failure_code",
+              "value": "workflow_error",
+              "type": "string"
+            },
+            {
+              "id": "status",
+              "name": "status_code",
+              "value": "={{ $json.statusCode || 0 }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "notes": "Store the outcome in the n8n execution. This does not send email or an external notification.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual sample email": {
+      "main": [
+        [
+          {
+            "node": "Load sample email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load sample email": {
+      "main": [
+        [
+          {
+            "node": "Normalize email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize email": {
+      "main": [
+        [
+          {
+            "node": "Email is usable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email is usable": {
+      "main": [
+        [
+          {
+            "node": "Call Python API",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record skipped email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Python API": {
+      "main": [
+        [
+          {
+            "node": "API call succeeded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API call succeeded": {
+      "main": [
+        [
+          {
+            "node": "Email already processed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route error type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email already processed": {
+      "main": [
+        [
+          {
+            "node": "Record duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs human priority review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs human priority review": {
+      "main": [
+        [
+          {
+            "node": "Flag for human review",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record routine result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route error type": {
+      "main": [
+        [
+          {
+            "node": "Record invalid API credentials",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record AI failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record database failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record rejected email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record workflow failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
